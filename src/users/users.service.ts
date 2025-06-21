@@ -50,12 +50,12 @@ export class UsersService {
       });
 
       return await newUser.save();
-    } catch (error) {
+    } catch (error: unknown) {
       if (
         typeof error === 'object' &&
         error !== null &&
         'code' in error &&
-        error.code === 11000
+        (error as { code: number }).code === 11000
       ) {
         // Duplicate key error
         throw new BadRequestException('Email already exists');
@@ -76,6 +76,7 @@ export class UsersService {
     const data = await this.userModel
       .find()
       .skip(skip)
+      .sort({ createdAt: -1 })
       .limit(itemsPerPage)
       .exec();
 
@@ -139,12 +140,12 @@ export class UsersService {
       }
 
       return updatedUser;
-    } catch (error) {
+    } catch (error: unknown) {
       if (
         typeof error === 'object' &&
         error !== null &&
         'code' in error &&
-        error.code === 11000
+        (error as { code: number }).code === 11000
       ) {
         // Duplicate key error
         throw new BadRequestException('Email already exists');
@@ -165,30 +166,90 @@ export class UsersService {
     try {
       // Check if timezone is valid by attempting to create a date with it
       Intl.DateTimeFormat(undefined, { timeZone: timezone });
-    } catch (_error) {
-      throw new BadRequestException(`Invalid timezone: ${timezone}`);
+    } catch (error) {
+      // We don't need the error details, just throw a BadRequestException
+      throw new BadRequestException(`${error} - Invalid timezone: ${timezone}`);
     }
   }
 
   // Method to find users with birthdays today in their timezone
   async findUsersWithBirthdayToday(): Promise<User[]> {
-    const users = await this.userModel.find().exec();
+    // Get current date
+    const now = new Date();
 
+    // Define the type for aggregation result
+    interface BirthdayAggregationResult {
+      _id: string;
+      name: string;
+      email: string;
+      birthday: Date;
+      timezone: string;
+      birthdayMonth: number;
+      birthdayDay: number;
+    }
+
+    // Create an aggregation pipeline to find users with birthdays today
+    // This avoids loading all users into memory
+    const users = await this.userModel
+      .aggregate<BirthdayAggregationResult>([
+        {
+          $addFields: {
+            // Extract month and day from birthday for comparison
+            birthdayMonth: { $month: '$birthday' },
+            birthdayDay: { $dayOfMonth: '$birthday' },
+            // Store timezone for later processing
+            userTimezone: '$timezone',
+          },
+        },
+        {
+          $match: {
+            // Initial filter to reduce the dataset to users with birthdays in recent days
+            // This is an optimization to reduce the number of timezone calculations needed
+            $or: [
+              // Today in UTC (handles most cases)
+              {
+                birthdayMonth: now.getMonth() + 1, // MongoDB months are 1-12
+                birthdayDay: now.getDate(),
+              },
+              // Yesterday in UTC (handles timezone differences)
+              {
+                birthdayMonth:
+                  new Date(now.getTime() - 86400000).getMonth() + 1,
+                birthdayDay: new Date(now.getTime() - 86400000).getDate(),
+              },
+              // Tomorrow in UTC (handles timezone differences)
+              {
+                birthdayMonth:
+                  new Date(now.getTime() + 86400000).getMonth() + 1,
+                birthdayDay: new Date(now.getTime() + 86400000).getDate(),
+              },
+            ],
+          },
+        },
+      ])
+      .exec();
+
+    // Final filtering based on timezone
+    // This is still needed because MongoDB doesn't support timezone-aware date operations
     return users.filter((user) => {
-      // Get current date in user's timezone
-      const now = new Date();
-      const userDate = new Date(
-        now.toLocaleString('en-US', { timeZone: user.timezone }),
-      );
+      try {
+        // Get current date in user's timezone
+        const userDate = new Date(
+          now.toLocaleString('en-US', { timeZone: user.timezone }),
+        );
 
-      // Get user's birthday
-      const birthday = new Date(user.birthday);
-
-      // Check if today is the user's birthday (ignoring year)
-      return (
-        userDate.getMonth() === birthday.getMonth() &&
-        userDate.getDate() === birthday.getDate()
-      );
+        // Check if today is the user's birthday (ignoring year)
+        return (
+          userDate.getMonth() + 1 === user.birthdayMonth && // Adjust for MongoDB months
+          userDate.getDate() === user.birthdayDay
+        );
+      } catch (error: unknown) {
+        // Log error but don't fail the entire operation
+        console.error(
+          `Error processing birthday for user ${user._id}: ${(error as Error).message}`,
+        );
+        return false;
+      }
     });
   }
 }
